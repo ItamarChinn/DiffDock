@@ -6,6 +6,8 @@ from esm import FastaBatchedDataset, pretrained
 from rdkit.Chem import AddHs, MolFromSmiles
 from torch_geometric.data import Dataset, HeteroData
 import esm
+import hashlib
+import pickle
 
 from datasets.process_mols import parse_pdb_from_path, generate_conformer, read_molecule, get_lig_graph_with_matching, \
     extract_receptor_structure, get_rec_graph
@@ -87,14 +89,74 @@ def get_sequences(protein_files, protein_sequences):
     return new_sequences
 
 
-def compute_ESM_embeddings(model, alphabet, labels, sequences):
+# def compute_ESM_embeddings(model, alphabet, labels, sequences):
+#     # settings used
+#     toks_per_batch = 4096
+#     repr_layers = [33]
+#     include = "per_tok"
+#     truncation_seq_length = 1022
+
+#     dataset = FastaBatchedDataset(labels, sequences)
+#     batches = dataset.get_batch_indices(toks_per_batch, extra_toks_per_seq=1)
+#     data_loader = torch.utils.data.DataLoader(
+#         dataset, collate_fn=alphabet.get_batch_converter(truncation_seq_length), batch_sampler=batches
+#     )
+
+#     assert all(-(model.num_layers + 1) <= i <= model.num_layers for i in repr_layers)
+#     repr_layers = [(i + model.num_layers + 1) % (model.num_layers + 1) for i in repr_layers]
+#     embeddings = {}
+
+#     with torch.no_grad():
+#         for batch_idx, (labels, strs, toks) in enumerate(data_loader):
+#             print(f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)")
+#             if torch.cuda.is_available():
+#                 toks = toks.to(device="cuda", non_blocking=True)
+
+#             out = model(toks, repr_layers=repr_layers, return_contacts=False)
+#             representations = {layer: t.to(device="cpu") for layer, t in out["representations"].items()}
+
+#             for i, label in enumerate(labels):
+#                 truncate_len = min(truncation_seq_length, len(strs[i]))
+#                 embeddings[label] = representations[33][i, 1: truncate_len + 1].clone()
+#     return embeddings
+
+
+def get_cache_id(model, alphabet, labels, sequences):
+    input_str = f"{model}-{alphabet}-{labels}-{sequences}"
+    return hashlib.md5(input_str.encode()).hexdigest()
+
+def compute_ESM_embeddings(model, alphabet, labels, sequences, cache_dir="."):
+    cache_id = get_cache_id(model, alphabet, labels, sequences)
+    cache_file = os.path.join(cache_dir, "esm_embeddings", f"{cache_id}.pkl")
+    
+    if os.path.exists(cache_file):
+        print(f"Loading embeddings from cache file {cache_file}")
+        with open(cache_file, "rb") as f:
+            embeddings = pickle.load(f)
+        return embeddings
+    
     # settings used
     toks_per_batch = 4096
     repr_layers = [33]
     include = "per_tok"
     truncation_seq_length = 1022
 
-    dataset = FastaBatchedDataset(labels, sequences)
+    embeddings = {}
+    missing_seqs = []
+    missing_labels = []
+    for i, seq in enumerate(sequences):
+        seq_cache_id = get_cache_id(model, alphabet, [labels[i]], [seq])
+        seq_cache_file = os.path.join(cache_dir, "esm_embeddings", f"{seq_cache_id}.pkl")
+        
+        if os.path.exists(seq_cache_file):
+            with open(seq_cache_file, "rb") as f:
+                seq_embedding = pickle.load(f)
+            embeddings[labels[i]] = seq_embedding
+        else:
+            missing_seqs.append(seq)
+            missing_labels.append(labels[i])
+
+    dataset = FastaBatchedDataset(missing_labels, missing_seqs)
     batches = dataset.get_batch_indices(toks_per_batch, extra_toks_per_seq=1)
     data_loader = torch.utils.data.DataLoader(
         dataset, collate_fn=alphabet.get_batch_converter(truncation_seq_length), batch_sampler=batches
@@ -102,21 +164,69 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences):
 
     assert all(-(model.num_layers + 1) <= i <= model.num_layers for i in repr_layers)
     repr_layers = [(i + model.num_layers + 1) % (model.num_layers + 1) for i in repr_layers]
-    embeddings = {}
-
+    
     with torch.no_grad():
-        for batch_idx, (labels, strs, toks) in enumerate(data_loader):
-            print(f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)")
+        for batch_idx, (batch_labels, batch_strs, batch_toks) in enumerate(data_loader):
+            print(f"Processing {batch_idx + 1} of {len(batches)} batches ({batch_toks.size(0)} sequences)")
             if torch.cuda.is_available():
-                toks = toks.to(device="cuda", non_blocking=True)
+                batch_toks = batch_toks.to(device="cuda", non_blocking=True)
 
-            out = model(toks, repr_layers=repr_layers, return_contacts=False)
+            out = model(batch_toks, repr_layers=repr_layers, return_contacts=False)
             representations = {layer: t.to(device="cpu") for layer, t in out["representations"].items()}
 
-            for i, label in enumerate(labels):
-                truncate_len = min(truncation_seq_length, len(strs[i]))
-                embeddings[label] = representations[33][i, 1: truncate_len + 1].clone()
+            for j, label in enumerate(batch_labels):
+                truncate_len = min(truncation_seq_length, len(batch_strs[j]))
+                seq_embedding = representations[33][j, 1: truncate_len + 1].clone()
+                embeddings[label] = seq_embedding
+                
+                # Cache the embedding for this sequence
+                seq_cache_id = get_cache_id(model, alphabet, [label], [batch_strs[j]])
+                seq_cache_file = os.path.join(cache_dir, f"{seq_cache_id}.pkl")
+                with open(seq_cache_file, "wb") as f:
+                    pickle.dump(seq_embedding, f)
+
+    # Cache the embeddings for all sequences
+    print(f"Saving embeddings to cache file {cache_file}")
+    with open(cache_file, "wb") as f:
+        pickle.dump(embeddings, f)
+    
     return embeddings
+
+
+def batch_generate_ESM_structure(model, filenames, sequences, batch_size=10):
+        model.set_chunk_size(256)
+        chunk_size = 256
+        # batchify and generate structures in batch
+        for i in range(0, len(filenames), batch_size):
+            batch_filenames = filenames[i:i + batch_size]
+            batch_sequences = sequences[i:i + batch_size]
+            output = None
+            while output is None:
+                try:
+                    with torch.no_grad():
+                        output = model.infer_pdb(batch_sequences)
+
+                    for i, sample in enumerate(output):
+                        filename = batch_filenames[i]
+                        with open(filename, "w") as f:
+                            f.write(sample)
+                            print("saved", filename)
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        print('| WARNING: ran out of memory on chunk_size', chunk_size)
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                del p.grad  # free some memory
+                        torch.cuda.empty_cache()
+                        chunk_size = chunk_size // 2
+                        if chunk_size > 2:
+                            model.set_chunk_size(chunk_size)
+                        else:
+                            print("Not enough memory for ESMFold")
+                            break
+                    else:
+                        raise e
+            return output is not None
 
 
 def generate_ESM_structure(model, filename, sequence):
@@ -183,7 +293,7 @@ class InferenceDataset(Dataset):
                 sequences.extend(s)
                 labels.extend([complex_names[i] + '_chain_' + str(j) for j in range(len(s))])
 
-            lm_embeddings = compute_ESM_embeddings(model, alphabet, labels, sequences)
+            lm_embeddings = compute_ESM_embeddings(model, alphabet, labels, sequences, cache_dir=out_dir)
 
             self.lm_embeddings = []
             for i in range(len(protein_sequences)):
@@ -228,41 +338,6 @@ class InferenceDataset(Dataset):
                 print("generating", len(files_to_generate), "structures with ESMFold")
                 batch_generate_ESM_structure(model, files_to_generate, sequences_to_generate, batch_size=10)
 
-
-    def batch_generate_ESM_structure(model, filenames, sequences, batch_size=10):
-        model.set_chunk_size(256)
-        chunk_size = 256
-        # batchify and generate structures in batch
-        for i in range(0, len(filenames), batch_size):
-            batch_filenames = filenames[i:i + batch_size]
-            batch_sequences = sequences[i:i + batch_size]
-            output = None
-            while output is None:
-                try:
-                    with torch.no_grad():
-                        output = model.infer_pdb(batch_sequences)
-
-                    for i, sample in enumerate(output):
-                        filename = batch_filenames[i]
-                        with open(filename, "w") as f:
-                            f.write(sample)
-                            print("saved", filename)
-                except RuntimeError as e:
-                    if 'out of memory' in str(e):
-                        print('| WARNING: ran out of memory on chunk_size', chunk_size)
-                        for p in model.parameters():
-                            if p.grad is not None:
-                                del p.grad  # free some memory
-                        torch.cuda.empty_cache()
-                        chunk_size = chunk_size // 2
-                        if chunk_size > 2:
-                            model.set_chunk_size(chunk_size)
-                        else:
-                            print("Not enough memory for ESMFold")
-                            break
-                    else:
-                        raise e
-            return output is not None
 
     def len(self):
         return len(self.complex_names)
