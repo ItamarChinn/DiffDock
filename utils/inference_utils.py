@@ -127,7 +127,12 @@ def get_cache_id(model, alphabet, labels, sequences):
 
 def compute_ESM_embeddings(model, alphabet, labels, sequences, cache_dir="."):
     cache_id = get_cache_id(model, alphabet, labels, sequences)
-    cache_file = os.path.join(cache_dir, "esm_embeddings", f"{cache_id}.pkl")
+    emb_cache_dir = os.path.join(cache_dir, "esm_embeddings")
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    if not os.path.exists(emb_cache_dir):
+        os.makedirs(emb_cache_dir)
+    cache_file = os.path.join(emb_cache_dir, f"{cache_id}.pkl")
     
     if os.path.exists(cache_file):
         print(f"Loading embeddings from cache file {cache_file}")
@@ -181,7 +186,7 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences, cache_dir="."):
                 
                 # Cache the embedding for this sequence
                 seq_cache_id = get_cache_id(model, alphabet, [label], [batch_strs[j]])
-                seq_cache_file = os.path.join(cache_dir, "esm_embeddings", f"{seq_cache_id}.pkl")
+                seq_cache_file = os.path.join(emb_cache_dir, f"{seq_cache_id}.pkl")
                 with open(seq_cache_file, "wb") as f:
                     pickle.dump(seq_embedding, f)
 
