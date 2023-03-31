@@ -197,17 +197,72 @@ class InferenceDataset(Dataset):
             self.lm_embeddings = precomputed_lm_embeddings
 
         # generate structures with ESMFold
+        # if None in protein_files:
+        #     print("generating missing structures with ESMFold")
+        #     model = esm.pretrained.esmfold_v1()
+        #     model = model.eval().cuda()
+
+        #     for i in range(len(protein_files)):
+        #         if protein_files[i] is None:
+        #             self.protein_files[i] = f"{out_dir}/{complex_names[i]}/{complex_names[i]}_esmfold.pdb"
+        #             if not os.path.exists(self.protein_files[i]):
+        #                 print("generating", self.protein_files[i])
+        #                 generate_ESM_structure(model, self.protein_files[i], protein_sequences[i])
+
+        # generate structures with ESMFold
         if None in protein_files:
             print("generating missing structures with ESMFold")
             model = esm.pretrained.esmfold_v1()
             model = model.eval().cuda()
 
+            files_to_generate = []
+            sequences_to_generate = []
             for i in range(len(protein_files)):
                 if protein_files[i] is None:
                     self.protein_files[i] = f"{out_dir}/{complex_names[i]}/{complex_names[i]}_esmfold.pdb"
                     if not os.path.exists(self.protein_files[i]):
-                        print("generating", self.protein_files[i])
-                        generate_ESM_structure(model, self.protein_files[i], protein_sequences[i])
+                        files_to_generate.append(self.protein_files[i])
+                        sequences_to_generate.append(protein_sequences[i])
+
+            if len(files_to_generate) > 0:
+                print("generating", len(files_to_generate), "structures with ESMFold")
+                batch_generate_ESM_structure(model, files_to_generate, sequences_to_generate, batch_size=10)
+
+
+    def batch_generate_ESM_structure(model, filenames, sequences, batch_size=10):
+        model.set_chunk_size(256)
+        chunk_size = 256
+        # batchify and generate structures in batch
+        for i in range(0, len(filenames), batch_size):
+            batch_filenames = filenames[i:i + batch_size]
+            batch_sequences = sequences[i:i + batch_size]
+            output = None
+            while output is None:
+                try:
+                    with torch.no_grad():
+                        output = model.infer_pdb(batch_sequences)
+
+                    for i, sample in enumerate(output):
+                        filename = batch_filenames[i]
+                        with open(filename, "w") as f:
+                            f.write(sample)
+                            print("saved", filename)
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        print('| WARNING: ran out of memory on chunk_size', chunk_size)
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                del p.grad  # free some memory
+                        torch.cuda.empty_cache()
+                        chunk_size = chunk_size // 2
+                        if chunk_size > 2:
+                            model.set_chunk_size(chunk_size)
+                        else:
+                            print("Not enough memory for ESMFold")
+                            break
+                    else:
+                        raise e
+            return output is not None
 
     def len(self):
         return len(self.complex_names)
