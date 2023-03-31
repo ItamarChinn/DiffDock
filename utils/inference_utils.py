@@ -181,7 +181,7 @@ def compute_ESM_embeddings(model, alphabet, labels, sequences, cache_dir="."):
                 
                 # Cache the embedding for this sequence
                 seq_cache_id = get_cache_id(model, alphabet, [label], [batch_strs[j]])
-                seq_cache_file = os.path.join(cache_dir, f"{seq_cache_id}.pkl")
+                seq_cache_file = os.path.join(cache_dir, "esm_embeddings", f"{seq_cache_id}.pkl")
                 with open(seq_cache_file, "wb") as f:
                     pickle.dump(seq_embedding, f)
 
